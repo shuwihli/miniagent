@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "安装研究智能体依赖",
+			"type": "shell",
+			"command": "uv add deepagents pytest python-dotenv"
+		}
+	]
+}

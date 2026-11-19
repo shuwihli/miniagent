@@ -1,0 +1,218 @@
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+# from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
+
+load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SKILLS_DIR = PROJECT_ROOT / ".agent" / "skills"
+SKILL_FILES: dict[str, Path] = {}
+SKILL_DESCRIPTIONS: dict[str, str] = {}
+for skill_file in SKILLS_DIR.rglob("*.md"):
+    content = skill_file.read_text(encoding="utf-8")
+    frontmatter = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not frontmatter:
+        continue
+
+    name = re.search(r"^name:\s*(.+)$", frontmatter.group(1), re.MULTILINE)
+    description = re.search(
+        r"^description:\s*(.+)$", frontmatter.group(1), re.MULTILINE
+    )
+    if not name or not description:
+        continue
+
+    skill_name = name.group(1).strip().strip("\"'")
+    if skill_name in SKILL_FILES:
+        raise ValueError(f"发现重复的技能名称：{skill_name}")
+    SKILL_FILES[skill_name] = skill_file
+    SKILL_DESCRIPTIONS[skill_name] = description.group(1).strip().strip("\"'")
+
+SKILL_CATALOG = "\n".join(
+    f"- {name}: {description}"
+    for name, description in sorted(SKILL_DESCRIPTIONS.items())
+)
+
+# 通过 System Prompt 约束 AI 行为
+SYSTEM_PROMPT = """你是一名严谨的数据分析助手。
+## 工作流程
+1. 先确认需要分析的数据和计算口径。
+2. 优先使用真实文件、计算结果和 shell/Python 输出，不要凭记忆猜数。
+3. 分析结果中区分“原始数据事实”和“统计结论”。
+4. 如果命令失败，说明失败原因并尝试更安全、可验证的替代方案。
+5. 最终回答包含结论、关键数字、使用的方法，以及数据中的限制。
+6. 你也可以陪用户闲聊,体现你的风趣幽默
+
+## 安全规则
+- 不要读取项目目录之外的文件。
+- 不要执行破坏性命令。
+- CSV 计算优先使用 Python 的 csv 模块或 pandas，并**保存可复查的脚本（如 analysis.py）**。"""
+
+SYSTEM_PROMPT += f"""
+
+## 可用技能
+用户请求与某项技能相关时，先调用 `load_skill` 读取该技能的完整流程，再按流程使用工具。
+技能是操作说明；只有实际调用工具并验证结果后，才能报告任务完成。
+{SKILL_CATALOG or "- 当前没有发现可用技能。"}"""
+
+# 2. 本地受限执行工具，安全防护
+DATA_DIR = Path(__file__).resolve().parent / ".agent/skills/"
+DATA_DIR.mkdir(exist_ok=True)
+
+@tool
+def load_skill(skill_name: str) -> str:
+    """读取一个本地技能的完整说明。
+    Args:
+        skill_name: 可用技能名称，例如 csv-data-analysis。
+    """
+    skill_file = SKILL_FILES.get(skill_name)
+    if skill_file is None:
+        available = ", ".join(sorted(SKILL_FILES)) or "无"
+        return f"技能不存在：{skill_name}。可用技能：{available}"
+    return skill_file.read_text(encoding="utf-8")
+
+
+@tool
+def write_file(file_name: str, content: str) -> str:
+    """在 Agent 的 .agent/skills 工作目录中创建或覆盖一个 Python 脚本。
+    Args:
+        file_name: 脚本文件名，例如 /analysis.py。
+        content: 要写入的完整 Python 源码。
+    """
+    relative_path = file_name.lstrip("/\\")
+    if Path(relative_path).name != relative_path or Path(relative_path).suffix != ".py":
+        return "拒绝写入：只允许在 Agent 的工作目录根目录中写入 .py 文件。"
+
+    file_path = DATA_DIR / relative_path
+    if file_path.is_symlink() or file_path.resolve().parent != DATA_DIR.resolve():
+        return "拒绝写入：脚本必须位于 Agent 的工作目录根目录。"
+
+    file_path.write_text(content, encoding="utf-8")
+    return f"脚本已写入：{file_path}"
+
+
+@tool
+def run_python(script_path: str) -> str:
+    """在受限数据目录中执行一个 Python 文件，并返回标准输出。
+    Args:
+        script_path: 数据目录内的脚本路径，例如 /analysis.py。
+    """
+    # 路径越权校验
+    relative_path = script_path.lstrip("/\\")
+    if Path(relative_path).name != relative_path:
+        return "拒绝执行：只允许执行 Agent 工作目录根目录中的脚本。"
+
+    file_path = DATA_DIR / relative_path
+    if (
+        file_path.is_symlink()
+        or file_path.resolve().parent != DATA_DIR.resolve()
+        or not file_path.is_file()
+        or file_path.suffix != ".py"
+    ):
+        return f"拒绝执行：文件不存在或不是 Python 文件：{script_path}"
+
+    # 执行代码
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(file_path)],
+            cwd=DATA_DIR, capture_output=True, text=True, timeout=30, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "执行失败：脚本超过 30 秒。"
+
+    output = completed.stdout.strip()
+    error = completed.stderr.strip()
+    return f"退出码：{completed.returncode}\n标准输出：\n{output}\n标准错误：\n{error}".rstrip()
+
+
+# 短期线程记忆
+from langgraph.checkpoint.memory import InMemorySaver
+model = ChatDeepSeek(model="deepseek-chat", temperature=0)
+checkpointer = InMemorySaver()
+
+
+agent = create_agent(
+    model,
+    tools=[load_skill, write_file, run_python],
+    system_prompt=SYSTEM_PROMPT,  # 参数名变成了 system_prompt
+)
+
+# 流式打印
+from langchain_core.messages import AIMessageChunk, ToolMessage
+
+def run_analysis(question: str, thread_id: str = "data-analysis-lesson") -> str:
+    """流式执行：逐 token 打印回答，同时返回完整文本。"""
+    full_text: list[str] = []
+    seen_tool_calls: set = set()
+
+    for mode, payload in agent.stream(
+        {"messages": [{"role": "user", "content": question}]},
+        config={"configurable": {"thread_id": thread_id}},
+        stream_mode=["messages", "updates"],
+    ):
+        if mode == "messages":
+            token, metadata = payload  #解包 
+            if not isinstance(token, AIMessageChunk):
+                continue
+
+            # 1)文本打印
+            if isinstance(token.content, str) and token.content:
+                print(token.content, end="", flush=True)
+                full_text.append(token.content)
+
+            # 2) 模型调用工具
+            for tc in token.tool_call_chunks or []:
+                key = tc.get("id") or tc.get("name")
+                if key and key not in seen_tool_calls:
+                    seen_tool_calls.add(key)
+                    print(f"\n[调用工具] {tc.get('name')} ...", end="", flush=True)
+
+        elif mode == "updates":
+            # 工具节点执行完成，补一个“完成”标记
+            for update in payload.values():
+                for msg in (update.get("messages") or []):
+                    if isinstance(msg, ToolMessage):
+                        print(" 完成", flush=True)
+
+    print()  # 收尾换行
+    return "".join(full_text)
+if __name__ == "__main__":
+    import uuid
+    thread_id = "data-analysis-lesson"
+    print("数据分析 Agent 已启动。")
+    print("· 直接输入提示词并回车发送；")
+    print("· 输入 new / 新会话 开启全新对话；")
+    print("· 输入 exit / quit / q / 退出 结束。")
+
+    while True:
+        try:
+            question = input("用户> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已退出。")
+            break
+
+        if not question:
+            continue
+
+        cmd = question.lower()
+        if cmd in {"exit", "quit", "q", "退出"}:
+            print("已退出。")
+            break
+        if cmd in {"new", "clear", "新会话", "清空"}:
+            thread_id = uuid.uuid4().hex[:8]
+            print(f"已开启新会话（thread_id={thread_id}）。")
+            continue
+
+        print("助手> ", end="", flush=True)
+        try:
+            answer = run_analysis(question, thread_id=thread_id)
+        except Exception as e:
+            print(f"\n[调用失败] {type(e).__name__}: {e}")
+            continue
